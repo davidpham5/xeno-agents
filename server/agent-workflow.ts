@@ -12,6 +12,57 @@ import {
 import { writeReport, chooseAction } from "./agent-brain";
 import { checkoutServiceUrl } from "./observe";
 
+import { logAgentActivity } from "./agent-log";
+import { actionPolicy } from "./tool-policy";
+import type { ActionName } from "../shared/types";
+import { environments } from "./schema";
+
+async function executeAction(
+  environmentId: string,
+  runId: string,
+  actionId: string,
+  name: ActionName,
+  expectedVersion?: number,
+) {
+  const input = expectedVersion === undefined ? {} : { expectedVersion };
+
+  // log an performed activity
+  await logAgentActivity(environmentId, runId, "act", `Calling ${name}`, {
+    actionId,
+    input,
+  });
+
+  try {
+    const response = await fetch(`${checkoutServiceUrl}/operations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        actionId,
+        name,
+        ...input,
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok)
+      throw new Error(String(result.error || "Tool call failed"));
+
+    if (result.stale !== true) {
+      await recordToolAction(environmentId, runId, actionId, name, input);
+    }
+  } catch (e) {
+    await logAgentActivity(
+      environmentId,
+      runId,
+      "act",
+      `${name} attempt failed`,
+      {
+        actionId,
+        error: e.message ?? String(e),
+      },
+    );
+  }
+}
+
 // The alert intake has already opened an incident. Build its harness here.
 export const incidentAgent = inngest.createFunction(
   {
@@ -19,13 +70,50 @@ export const incidentAgent = inngest.createFunction(
     name: "Checkout incident agent",
     triggers: { event: "incident/opened" },
   },
-  // async ({ event, step }) => {
-  //   await setRun(event.data.runId, 'escalated', 'Harness not implemented yet')
-  //   return { runId: event.data.runId, next: 'Build the observe–decide–act loop' }
-  // },
 
   async ({ event, step }) => {
-    const { environmentId, runId } = event.data;
+    const { environmentId, runId, instanceId } = event.data;
+    const run = await getRun(runId);
+
+    if (
+      run.instanceId !== instanceId ||
+      ["completed", "failed", "cancelled", "escalated", "superseded"].includes(
+        run.status,
+      )
+    ) {
+      return;
+    }
+
+    // at the top of every single loop, what we want to do and add a checkpoint?
+    for (let cycle = 1; cycle <= 24; cycle++) {
+      // get current run
+      const current = await getRun(runId);
+      if (
+        [
+          "completed",
+          "failed",
+          "cancelled",
+          "escalated",
+          "superseded",
+        ].includes(current.status)
+      ) {
+        return;
+      }
+      const state = await step.run(`observer-state-${cycle}`, () => {
+        return agentState(environmentId, runId);
+      });
+
+      if (goalSatisfied(state, run.goalCondition)) {
+        const report = await step.run(`write-report-${cycle}`, () =>
+          writeReport(run.goal, state),
+        );
+        await step.run(`complete-run${cycle}`, () =>
+          setRun(runId, "completed", null, report),
+        );
+        // await setRun(runId, "completed", null, report);
+        return { report };
+      }
+    }
 
     return step.run("whole-agentLoop", async () => {
       const run = await getRun(runId);
