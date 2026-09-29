@@ -36,6 +36,9 @@ import {
   recordToolAction,
   setIteration,
   setRun,
+  staleProposal,
+  getProposal,
+  proposeAction,
 } from "./agent-data";
 import { writeReport, chooseAction } from "./agent-brain";
 import { checkoutServiceUrl } from "./observe";
@@ -364,10 +367,62 @@ export const incidentAgent = inngest.createFunction(
       // Destructive/high-risk actions (e.g. rollback_release) require approval.
       // The approval gate isn't built, so escalate instead of acting unilaterally.
       if (policy === "approval") {
-        await step.run(`approval-unavailable-${cycle}`, () =>
-          setRun(runId, "escalated", "Approval gate is not built yet"),
+        // await step.run(`approval-unavailable-${cycle}`, () =>
+        //   setRun(runId, "escalated", "Approval gate is not built yet"),
+        // );
+        const input = { expectedVersion: state.world.version }; //snapshot of the state
+        const proposalId = await step.run(
+          `propose-action-${cycle}`,
+          async () => {
+            const proposal = await proposeAction(
+              environmentId,
+              runId,
+              actionId,
+              decision.action,
+              input,
+            );
+            return proposal.id;
+          },
         );
-        return;
+        // why create a proposal to only get the id and then here
+        // and then make a proposal here?
+        // because proposal overwrite. Get variable from DB and not cache value at some point
+        // Getting stale proposals from the above will lead to a bug
+        let proposal = await step.run(`read-human-${cycle}`, () =>
+          getProposal(proposalId),
+        );
+
+        let check = 0;
+
+        while (proposal.status === "pending") {
+          check++;
+          await step.waitForEvent(`wait-for-human-${cycle}`, {
+            event: "agent/approval.decided",
+            if: `async.data.proposalId == "${proposalId}"`,
+            timeout: "10s",
+          });
+
+          proposal = await step.run(`reconcile-human-${cycle}-${check}`, () =>
+            getProposal(proposalId),
+          );
+        }
+        if (proposal.status !== "approved") {
+          await step.run(`stop-after-human-${cycle}`, () =>
+            setRun(runId, "escalated", `Human decision: ${proposal.status}`),
+          );
+          return;
+        }
+
+        const fresh = await step.run(`recheck-approved-state-${cycle}`, () =>
+          agentState(environmentId, runId),
+        );
+
+        if (fresh.world.version !== input.expectedVersion) {
+          await step.run(`invalidate-approval-${cycle}`, () =>
+            staleProposal(proposalId),
+          );
+          continue;
+        }
       }
 
       // Actually run the tool. For writes we pass the observed world version so
