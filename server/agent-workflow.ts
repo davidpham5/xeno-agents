@@ -257,16 +257,81 @@ export const incidentAgent = inngest.createFunction(
       // actually allowed to run. Several actions aren't fully built yet, so we
       // escalate (hand off to a human) instead of pretending we handled them.
 
-      // "wait" (pause for a future event) and goal-gated "complete" both need
-      // machinery we haven't built, so escalate rather than fake it.
+      // "wait", "request_help", and goal-gated "complete" all mean the same thing:
+      // the agent has no safe action to take right now. Instead of escalating, we
+      // SUSPEND the run and wait for the world to change (a new service event),
+      // then re-observe and decide again. This is the heart of lesson 4.
       if (
         decision.action === "wait" ||
+        decision.action === "request_help" ||
         (decision.action === "complete" && run.goalCondition)
       ) {
-        await step.run(`wait-unavailable-${cycle}`, () =>
-          setRun(runId, "escalated", "Event wait is not built yet"),
+        // The model said "complete" but a goal condition is configured and not
+        // yet met — log that we're overriding it so it can't falsely finish.
+        if (decision.action === "complete") {
+          await step.run(`reject-completion-${cycle}`, () =>
+            logAgentActivity(
+              environmentId,
+              runId,
+              "human",
+              "Completion blocked by configured goal condition",
+              { condition: run.goalCondition },
+            ),
+          );
+        }
+        // Human help isn't built yet, so we note the question and fall through to
+        // the same wait-for-service-evidence loop below.
+        if (decision.action === "request_help") {
+          await step.run(`defer-help-${cycle}`, () =>
+            logAgentActivity(
+              environmentId,
+              runId,
+              "human",
+              "Help is not available yet",
+              { question: decision.detail },
+            ),
+          );
+        }
+        // Mark the run "waiting" (this is the state you'll see as sleeping in the
+        // Inngest dashboard), with a reason that fits which action we're waiting on.
+        await step.run(`wait-status-${cycle}`, () =>
+          setRun(
+            runId,
+            "waiting",
+            decision.action === "request_help"
+              ? "Help is not available yet; waiting for fresh service evidence"
+              : decision.action === "wait"
+                ? decision.reason
+                : "Recovery is not verified",
+          ),
         );
-        return;
+
+        // THE WAIT LOOP. Park here using NO compute until the world changes.
+        let check = 0;
+        while (true) {
+          // Re-read the run. If a human cancelled/superseded/failed it while we
+          // slept, stop the whole function.
+          const latest = await step.run(
+            `read-event-sequence-${cycle}-${check}`,
+            () => getRun(runId),
+          );
+          if (["cancelled", "superseded", "failed"].includes(latest.status))
+            return;
+          // The world moved since we last observed (fresh evidence arrived) →
+          // break out so the for-loop re-observes with the new state.
+          if (latest.eventSequence > state.eventSequence) break;
+          check++;
+          // Sleep (zero compute) until an "incident/updated" event for THIS run
+          // arrives, or 10s elapses. On timeout we just loop and re-check.
+          await step.waitForEvent(`wait-for-service-${cycle}-${check}`, {
+            event: "incident/updated",
+            if: `async.data.runId == "${runId}"`,
+            timeout: "10s",
+          });
+          // The timeout also reconciles an event that arrived just before the wait.
+        }
+        // Back to the top of the for-loop → OBSERVE fresh state → DECIDE again.
+        continue;
       }
 
       // "complete" with NO goal condition configured: we trust the model's
@@ -283,14 +348,8 @@ export const incidentAgent = inngest.createFunction(
         return { report };
       }
 
-      // The model wants a human (e.g. an external dependency it can't fix).
-      // The human-in-the-loop path isn't built, so escalate.
-      if (decision.action === "request_help") {
-        await step.run(`help-unavailable-${cycle}`, () =>
-          setRun(runId, "escalated", "Human help path is not built yet"),
-        );
-        return;
-      }
+      // (Note: "request_help" no longer escalates here — it's handled in the
+      // wait branch above, which suspends until fresh service evidence arrives.)
 
       // Unique ID for this specific attempt, used as an idempotency key by the
       // service. (Scoped per attempt, so if a response is lost we may retry as a
