@@ -4,11 +4,13 @@ import {
   agentState,
   getRun,
   goalSatisfied,
+  recordDecision,
   recordToolAction,
   setIteration,
   setRun,
 } from "./agent-data";
-import { writeReport } from "./agent-brain";
+import { writeReport, chooseAction } from "./agent-brain";
+import { checkoutServiceUrl } from "./observe";
 
 // The alert intake has already opened an incident. Build its harness here.
 export const incidentAgent = inngest.createFunction(
@@ -37,7 +39,71 @@ export const incidentAgent = inngest.createFunction(
           await setRun(runId, "completed", null, report);
           return { report };
         }
+
+        const decision = await chooseAction(run.goal, state);
+        await setIteration(runId, cycle);
+        // how do i describe the state of the world vividly?
+        // logs it to the harness
+        await recordDecision(
+          environmentId,
+          runId,
+          cycle,
+          decision.action,
+          decision.reason,
+        );
+        // let's handle exceptions where it needs our help.
+        if (
+          decision.action === "wait" ||
+          decision.action === "complete" ||
+          decision.action === "request_help"
+        ) {
+          await setRun(
+            runId,
+            "escalated",
+            "this first loop cannot pause just yet",
+          );
+          return;
+        }
+
+        if (decision.action === "rollback_release") {
+          // for now don't run the rollback
+          await setRun(runId, "escalated", "Approvals not build yet");
+        }
+
+        // any decision than these four defined decisions, let it rip
+
+        const actionId = `${runId}: ${randomUUID}`; // we want to be super clinical with trusting our agent. we need recipts
+        // keep the business logic on the service itself. just perform the action for us --> /operations
+        const response = await fetch(checkoutServiceUrl + "/operations", {
+          // this is how we actually change the state is changed
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            actionId,
+            name: decision.action,
+            expectedVersion: state.world.version, // version our state like we version our api
+          }),
+        });
+
+        // need to confirm to the Harness something happened
+        const result = await response.json();
+        if (!response.ok)
+          throw new Error(String(result.error ?? response.status));
+        if (result.stale !== true) {
+          await recordToolAction(
+            environmentId,
+            runId,
+            actionId,
+            decision.action,
+            {
+              expectedVersion: state.world.version,
+            },
+            result,
+          );
+        }
       }
+      // update the run
+      await setRun(runId, "escalated", "Decision limit reached");
     });
   },
 );
